@@ -1,0 +1,8 @@
+# Dependencies for Reasoning-Aware RAG system
+
+streamlit
+sentence-transformers
+faiss-cpu
+openai==0.28.1
+PyPDF2
+python-dotenv

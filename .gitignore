@@ -1,0 +1,16 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Environment variables
+.env
+
+# Uploaded files
+data/uploaded_docs/
+
+# Streamlit cache
+.streamlit/
+
+# OS files
+.DS_Store
