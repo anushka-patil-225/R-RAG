@@ -1,49 +1,107 @@
 """
-LLM module (offline / no API).
-
-Generates answers grounded in retrieved document context
-without using any external API.
+LLM interface module.
+Supports Groq (online) and Ollama (offline) with automatic fallback.
+API key is read from environment or set directly.
 """
 
-def generate_answer(question, context_chunks):
+import os
+import time
+import requests
+
+# --- Configuration ---
+MODE = "online"  # "online" uses Groq, "offline" uses Ollama
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+LOCAL_MODEL = "phi3:mini"
+
+# Set your Groq API key here OR via environment variable GROQ_API_KEY
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL = "llama3-8b-8192"
+
+
+def call_groq(prompt, system_prompt=None, max_tokens=1024):
+    """Call Groq cloud API with retry logic (up to 2 attempts)."""
+    if not GROQ_API_KEY:
+        return None
+
+    for attempt in range(2):
+        try:
+            from groq import Groq
+            client = Groq(api_key=GROQ_API_KEY)
+
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
+
+            response = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=messages,
+                temperature=0.1,   # lower temperature = more factual, less creative
+                max_tokens=max_tokens
+            )
+            content = response.choices[0].message.content.strip()
+
+            if not content:
+                print(f"[GROQ WARN] Empty response on attempt {attempt + 1}, retrying...")
+                time.sleep(2)
+                continue
+
+            return content
+
+        except Exception as e:
+            print(f"[GROQ ERROR] Attempt {attempt + 1}: {e}")
+            if attempt < 1:
+                time.sleep(2)
+
+    return None
+
+
+def call_ollama(prompt, system_prompt=None, max_tokens=800):
+    """Call local Ollama API."""
+    try:
+        payload = {
+            "model": LOCAL_MODEL,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.1,   # lower temperature = more factual
+                "num_predict": max_tokens,
+                "top_p": 0.9
+            }
+        }
+        if system_prompt:
+            payload["system"] = system_prompt
+
+        res = requests.post(OLLAMA_URL, json=payload, timeout=180)
+        data = res.json()
+        content = data.get("response", "").strip()
+        return content if content else None
+    except Exception as e:
+        print(f"[OLLAMA ERROR] {e}")
+        return None
+
+
+def call_llm(prompt, system_prompt=None, max_tokens=1024):
     """
-    Generate a concise, human-readable summary
-    from retrieved document chunks.
+    Call the configured LLM with fallback.
+    Returns response string or error message.
     """
+    if MODE == "online":
+        result = call_groq(prompt, system_prompt, max_tokens)
+        if result:
+            return result
+        print("[WARN] Groq failed, falling back to Ollama...")
+        result = call_ollama(prompt, system_prompt, max_tokens)
+        if result:
+            return result
+    else:
+        result = call_ollama(prompt, system_prompt, max_tokens)
+        if result:
+            return result
+        print("[WARN] Ollama failed, falling back to Groq...")
+        result = call_groq(prompt, system_prompt, max_tokens)
+        if result:
+            return result
 
-    if not context_chunks:
-        return "No relevant information found in the document."
-
-    summary = []
-    summary.append(f"The document primarily discusses the following:")
-
-    for chunk in context_chunks:
-        sentences = chunk.split(".")
-        for s in sentences:
-            if len(s.strip()) > 60:
-                summary.append("- " + s.strip())
-                break
-
-    final_answer = "\n".join(summary[:6])
-
-    final_answer += (
-        "\n\nOverall, the document focuses on designing, implementing, "
-        "and deploying an AI-based system, explaining its architecture, "
-        "technologies used, applications, and real-world relevance."
-    )
-
-    return final_answer
-
-
-if __name__ == "__main__":
-    context = [
-        "This document discusses a MERN stack homestay booking platform.",
-        "Users can list places and book stays through the application."
-    ]
-
-    print(
-        generate_answer(
-            "What is this project about?",
-            context
-        )
-    )
+    return "❌ LLM unavailable. Check your API key or Ollama connection."

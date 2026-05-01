@@ -1,17 +1,28 @@
 """
 Embedding module.
-
 Uses sentence-transformers to convert text chunks into vectors.
+Model is loaded once and cached.
 """
 
-from sentence_transformers import SentenceTransformer
-model = SentenceTransformer('all-MiniLM-L6-v2')
+import numpy as np
+
+_model = None
+
+
+def get_model():
+    global _model
+    if _model is None:
+        from sentence_transformers import SentenceTransformer
+        _model = SentenceTransformer('all-MiniLM-L6-v2')
+    return _model
+
 
 def generate_embeddings(text_chunks):
-    """Generate embeddings for a list of text chunks."""
-    return model.encode(text_chunks)
-
-if __name__ == "__main__":
-    sample = ["This is a test sentence", "Another sentence"]
-    embeddings = generate_embeddings(sample)
-    print(embeddings.shape)
+    model = get_model()
+    embeddings = model.encode(
+        text_chunks,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+        batch_size=32
+    )
+    return np.array(embeddings).astype("float32")
