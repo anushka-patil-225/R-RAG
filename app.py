@@ -801,28 +801,9 @@ for msg in st.session_state.chat_history:
   <div class="answer-text">{answer_text}</div>
 </div>""", unsafe_allow_html=True)
 
-        if evidence_points:
-            with st.expander("🔍 Evidence used"):
-                for pt in evidence_points:
-                    st.markdown(f"- {pt}")
-
         if reasoning_text:
             with st.expander("💡 Reasoning"):
                 st.markdown(f"*{reasoning_text}*")
-
-        if msg.get("sub_queries") and len(msg["sub_queries"]) > 1:
-            with st.expander(f"🔗 Retrieval steps ({len(msg['sub_queries'])})"):
-                for i, sq in enumerate(msg["sub_queries"], 1):
-                    st.markdown(f"`{i}.` {sq}")
-
-        if msg.get("reasoning_trace"):
-            with st.expander("🧠 Reasoning Trace"):
-                for step in msg["reasoning_trace"]:
-                    st.markdown(f"""
-<div class="trace-step">
-  <div class="trace-step-title">{step['step']}</div>
-  <div class="trace-step-detail">{step['detail']}</div>
-</div>""", unsafe_allow_html=True)
 
         if msg.get("sources"):
             with st.expander(f"📄 Sources ({len(msg['sources'])})"):
