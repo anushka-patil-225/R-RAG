@@ -7,15 +7,29 @@ API key is read from environment or set directly.
 import os
 import time
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # --- Configuration ---
-MODE = "online"  # "online" uses Groq, "offline" uses Ollama
+MODE = "online"
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 LOCAL_MODEL = "phi3:mini"
 
-# Set your Groq API key here OR via environment variable GROQ_API_KEY
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_API_KEY = ""
+
+# Try Streamlit secrets first
+try:
+    import streamlit as st
+    GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", "")
+except:
+    pass
+
+# Fallback to local environment
+if not GROQ_API_KEY:
+    GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+
 GROQ_MODEL = "llama3-8b-8192"
 
 
@@ -50,9 +64,14 @@ def call_groq(prompt, system_prompt=None, max_tokens=1024):
             return content
 
         except Exception as e:
-            print(f"[GROQ ERROR] Attempt {attempt + 1}: {e}")
-            if attempt < 1:
-                time.sleep(2)
+                error_msg = f"[GROQ ERROR] Attempt {attempt + 1}: {e}"
+                print(error_msg)
+
+    # Return actual error for debugging
+                if attempt == 1:
+                   return f"❌ {error_msg}"
+                if attempt < 1:
+                   time.sleep(2)
 
     return None
 

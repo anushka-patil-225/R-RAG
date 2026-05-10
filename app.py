@@ -655,8 +655,8 @@ with st.sidebar:
         label_visibility="collapsed",
         placeholder="gsk_..."
     )
-    if api_key_input:
-        llm.GROQ_API_KEY = api_key_input
+    if api_key_input.strip():
+        llm.GROQ_API_KEY = api_key_input.strip()
 
     st.markdown("### Upload Documents")
     uploaded_files = st.file_uploader(
