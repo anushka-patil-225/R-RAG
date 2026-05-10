@@ -1,20 +1,17 @@
 """
 reasoning.py — Domain-Agnostic Reasoning Engine for TraceAI
-Pipeline: Classify → Decompose → Retrieve → (Extract Facts if comparison) → Generate → Verify
+Pipeline: Classify → Decompose/Expand → Retrieve → (Extract Facts if comparison) → Generate → Verify
 
-Fixes in this version:
-  [FIX A] Simple factual queries skip fact-extraction entirely — raw evidence goes
-          straight into answer generation (eliminates 2 extra LLM calls per question).
-  [FIX B] LOW_CONF threshold lowered from 0.30 → 0.20 (all-MiniLM-L6-v2 scores on
-          domain documents legitimately land in the 0.25-0.45 range).
-  [FIX C] Verification failure no longer auto-downgrades to low-confidence when the
-          retrieved evidence clearly contains the answer; it only flags truly invented claims.
-  [FIX D] SYNTHESIS_SYSTEM prompt is simpler and does not fight with the context format,
-          so llama3-8b-8192 produces the required labels consistently.
-  [FIX E] Fact extraction is now only triggered for comparison/contradiction queries,
-          keeping the token budget low and reducing Groq rate-limit exposure.
-  [FIX F] Raw-evidence context is always included as a fallback in generate_answer,
-          so even if fact extraction returns nothing the model still has the text.
+Key improvements in this version:
+  [A] Comparison queries now generate targeted sub-queries (e.g. "confidentiality duration",
+      "notification timeline") so every relevant section from every document is retrieved.
+  [B] SYNTHESIS_SYSTEM allows rich multi-point structured answers — not just 1-3 sentences.
+  [C] Cross-document retrieval: for multi-doc KBs, a catch-up pass ensures every document
+      contributes at least one chunk so nothing is silently missed.
+  [D] Evidence cap raised to 5000 chars (comparison) / 3500 chars (factual).
+  [E] Fact extraction uses more content per chunk for better triple coverage.
+  [F] compare_facts summary produces a clean per-inconsistency enumeration.
+  [G] parse_structured_answer converts newlines to <br> so answers render correctly in HTML.
 """
 
 import re
@@ -32,22 +29,38 @@ BASE_SYSTEM = """You are an evidence-grounded reasoning engine.
 
 JSON_SYSTEM = BASE_SYSTEM + "\nOutput ONLY valid JSON. No preamble, explanation, or markdown fences."
 
-# [FIX D] Simpler synthesis prompt that works reliably with llama3-8b-8192
 SYNTHESIS_SYSTEM = BASE_SYSTEM + """
 Your task: answer the question using ONLY the evidence provided.
+Respond using EXACTLY these four sections in this order. Each label on its own line.
 
-You MUST respond using exactly these labels on their own lines:
-ANSWER: <direct answer, 1-3 sentences. If the answer is a number/name/date, state it explicitly.>
+--- FORMAT ---
+ANSWER:
+<Concise direct answer. No filenames. No inline citations. No verbose detail.
+ For a single fact: 1-2 sentences.
+ For multi-point questions: one bullet (•) per key point, brief phrasing only.
+ Keep it short — all detail and attribution goes in EVIDENCE below.>
+
 EVIDENCE:
-- <fact + source filename>
-- <fact + source filename>
-REASONING: <one sentence explaining why the evidence supports the answer>
+- <Exact supporting fact> — Source: <filename>, <section if visible>
+- <Another fact> — Source: <filename>, <section if visible>
+<List every specific fact that supports the answer. Each bullet must cite its source.
+ For inconsistency questions: list every conflict with both values and both filenames.>
+
+REASONING:
+<2-4 sentences explaining how the evidence leads to the answer.
+ Name which document contributes which piece. For cross-document questions, explain
+ how the documents relate or conflict.>
+
 CONFIDENCE: <high | medium | low>
+--- END FORMAT ---
 
 Rules:
-- ANSWER must be the very first label.
-- Do not add any text before ANSWER: or after CONFIDENCE:.
-- If the evidence does not contain the answer, write: ANSWER: The information is not present in the provided documents."""
+- ANSWER must be brief and clean — no filenames, no parenthetical citations.
+- All source attribution belongs in EVIDENCE, never in ANSWER.
+- All explanation belongs in REASONING, never in ANSWER.
+- Start your response with ANSWER: — no preamble before it.
+- End with CONFIDENCE: — nothing after it.
+- If the answer is absent from the evidence: write ANSWER: The information is not present in the provided documents."""
 
 VERIFY_SYSTEM = (
     "You are a strict fact-checker. "
@@ -60,7 +73,6 @@ VERIFY_SYSTEM = (
 # ── JSON Helper ────────────────────────────────────────────────────────────────
 
 def _parse_json(text: str, fallback):
-    """Strip markdown fences and safely parse JSON."""
     if not text:
         return fallback
     try:
@@ -75,7 +87,7 @@ def _parse_json(text: str, fallback):
 _COMPARISON_RE = re.compile(
     r"\b(compar|differ|conflict|contradict|inconsisten|mismatch|vs\.?|versus|"
     r"same as|unlike|contrast|discrepan|overlap|both|neither|agree|disagree|"
-    r"identif\w+ contradiction|find contradiction)\b",
+    r"identif\w+ (inconsisten|conflict|contradict|discrepan)|find (inconsisten|conflict))\b",
     re.IGNORECASE,
 )
 
@@ -83,7 +95,63 @@ def is_comparison_query(question: str) -> bool:
     return bool(_COMPARISON_RE.search(question))
 
 
-# ── Question Decomposition ─────────────────────────────────────────────────────
+# ── Targeted Sub-Query Generation for Comparison Queries ──────────────────────
+
+_FALLBACK_COMPARISON_QUERIES = [
+    "confidentiality obligation duration after termination",
+    "incident notification reporting timeline hours days",
+    "data deletion destruction period after termination",
+    "audit frequency annual",
+    "log record retention period months",
+    "subcontractor approval security requirements",
+    "liability indemnification cap",
+    "payment terms invoice period",
+]
+
+def generate_comparison_subqueries(question: str, documents: list) -> list:
+    """
+    [A] For comparison/inconsistency queries, use an LLM call to generate targeted
+    sub-queries covering the specific topics that are likely to differ across documents.
+    This ensures retrieval covers all relevant sections, not just those semantically
+    similar to the broad question.
+    """
+    doc_names = sorted({d["filename"] for d in documents})
+    doc_list  = ", ".join(doc_names)
+
+    prompt = f"""The user wants to find inconsistencies or differences across multiple documents.
+Documents available: {doc_list}
+User question: "{question}"
+
+Generate 7 specific retrieval queries that will locate sections likely to contain
+different or conflicting values across these documents. Target concrete operational
+specifics such as: time durations, notification deadlines, retention periods, audit
+frequencies, approval thresholds, deletion timelines, and compliance requirements.
+
+Return ONLY a numbered list of short queries (4-10 words each). No explanation."""
+
+    result = call_llm(prompt, system_prompt=BASE_SYSTEM, max_tokens=250)
+
+    queries = [question]   # always include the original
+
+    if result and "❌" not in result:
+        for line in result.strip().split("\n"):
+            cleaned = re.sub(r"^[\d\.\)\-\•\*]+\s*", "", line.strip()).strip()
+            if cleaned and 5 <= len(cleaned) <= 120:
+                queries.append(cleaned)
+                if len(queries) >= 9:
+                    break
+
+    # Pad with safe fallbacks if the LLM returned too few
+    for fb in _FALLBACK_COMPARISON_QUERIES:
+        if len(queries) >= 9:
+            break
+        if not any(fb.split()[0] in q.lower() for q in queries):
+            queries.append(fb)
+
+    return queries
+
+
+# ── Question Decomposition (factual queries) ───────────────────────────────────
 
 _JUNK_RE = re.compile(
     r"(not found|no information|unavailable|n/a|cannot determine|"
@@ -96,13 +164,7 @@ def _is_valid_subquery(text: str) -> bool:
     return len(text) >= 10 and not _JUNK_RE.search(text)
 
 def decompose_question(question: str) -> list:
-    """
-    Split multi-hop questions into retrieval sub-queries.
-    Short questions and comparison queries skip the LLM call.
-    """
-    if is_comparison_query(question):
-        return [question]
-
+    """Split multi-hop factual questions into retrieval sub-queries."""
     if len(question.split()) < 10:
         return [question]
 
@@ -142,8 +204,8 @@ Return ONLY the numbered list. Nothing else."""
 
 def extract_facts(chunks: list) -> list:
     """
-    Extract flat (subject, attribute, value, source) triples.
-    Called ONLY for comparison/contradiction queries to keep LLM calls low.
+    [E] Extract (subject, attribute, value, source) triples.
+    Uses more content per chunk to avoid missing key facts.
     """
     if not chunks:
         return []
@@ -152,12 +214,12 @@ def extract_facts(chunks: list) -> list:
     for chunk in chunks:
         fname = chunk["filename"]
         source_blocks.setdefault(fname, [])
-        source_blocks[fname].append(chunk["text"][:500])
+        source_blocks[fname].append(chunk["text"][:900])   # was 500
 
     evidence_text = ""
     for fname, texts in source_blocks.items():
-        evidence_text += f"[Source: {fname}]\n" + "\n".join(texts[:3]) + "\n\n"
-    evidence_text = evidence_text[:3500]
+        evidence_text += f"[Source: {fname}]\n" + "\n---\n".join(texts[:8]) + "\n\n"  # was 3
+    evidence_text = evidence_text[:6000]   # was 3500
 
     prompt = f"""Read the text below and extract every factual statement as a structured triple.
 
@@ -175,14 +237,16 @@ Output ONLY this JSON:
 
 Rules:
 - Extract ONLY facts explicitly written in the text. Never infer.
-- Use concise attribute names: duration, deadline, penalty, salary, status, rate, clause, etc.
-- If the same attribute appears with different values in different [Source:] blocks, create one entry per source.
+- Use concise attribute names: duration, deadline, penalty, notification_period, deletion_period,
+  retention_period, audit_frequency, approval_requirement, access_level, etc.
+- If the same attribute appears with different values in different [Source:] blocks, create one
+  entry per source — this is critical for finding inconsistencies.
 - Return an empty list if no facts can be extracted.
 
 TEXT:
 {evidence_text}"""
 
-    result = call_llm(prompt, system_prompt=JSON_SYSTEM, max_tokens=1400)
+    result = call_llm(prompt, system_prompt=JSON_SYSTEM, max_tokens=1800)
     data   = _parse_json(result, {})
     facts  = data.get("facts", []) if isinstance(data, dict) else []
 
@@ -196,8 +260,8 @@ TEXT:
 
 def compare_facts(facts: list, question: str) -> dict:
     """
-    Group facts by (subject, attribute) and compare values across sources.
-    Pure-Python grouping + one focused LLM call for the human-readable summary.
+    [F] Group facts by (subject, attribute) and compare values across sources.
+    Produces a clean per-inconsistency enumeration in the summary.
     """
     empty = {"conflicts": [], "matches": [], "missing": [], "summary": ""}
     if not facts:
@@ -239,21 +303,18 @@ def compare_facts(facts: list, question: str) -> dict:
 
     summary = ""
     if conflicts:
-        conflict_json = json.dumps(conflicts[:10], indent=2)
-        prompt = f"""These attribute conflicts were found between documents.
-Summarise only those relevant to the question.
-
+        conflict_json = json.dumps(conflicts[:12], indent=2)
+        prompt = f"""These conflicts were detected between documents.
 Question: {question}
 
 Conflicts (JSON):
 {conflict_json}
 
-Write a concise bullet-point list. Each bullet:
-  "• <subject> / <attribute>: <value_a> (source_a) vs <value_b> (source_b)"
+For each conflict that is relevant to the question, write one line in this format:
+[Topic / Attribute]: [Document A] states "[value_a]" vs [Document B] states "[value_b]"
 
-If none are relevant, write "No relevant conflicts found."
-No preamble. No explanation."""
-        summary = call_llm(prompt, system_prompt=BASE_SYSTEM, max_tokens=400) or ""
+List ALL relevant conflicts. No preamble. No explanation beyond the conflict lines."""
+        summary = call_llm(prompt, system_prompt=BASE_SYSTEM, max_tokens=500) or ""
 
     return {
         "conflicts": conflicts,
@@ -273,21 +334,17 @@ def generate_answer(
     is_comparison:  bool,
 ) -> str:
     """
-    Generate a grounded answer.
-
-    [FIX A] Simple factual queries: always lead with raw_evidence so the model
-    has the full text. Facts (if available) are an additional structured layer.
-    [FIX F] raw_evidence is always appended as a fallback context block.
+    [D] Evidence cap raised; comparison mode leads with structured conflict data.
     """
     ctx_parts = []
 
-    # For comparison queries, lead with structured facts + conflict analysis
     if is_comparison:
         if facts:
-            ctx_parts.append(f"EXTRACTED FACTS:\n{json.dumps(facts[:40], indent=2)}")
+            ctx_parts.append(f"EXTRACTED FACTS:\n{json.dumps(facts[:50], indent=2)}")
         if comparison.get("conflicts"):
             ctx_parts.append(
-                f"CONFLICTS DETECTED:\n{json.dumps(comparison['conflicts'][:10], indent=2)}"
+                f"CONFLICTS DETECTED ({len(comparison['conflicts'])}):\n"
+                + json.dumps(comparison["conflicts"][:15], indent=2)
             )
         if comparison.get("matches"):
             ctx_parts.append(
@@ -295,9 +352,10 @@ def generate_answer(
             )
         if comparison.get("summary"):
             ctx_parts.append(f"CONFLICT SUMMARY:\n{comparison['summary']}")
-
-    # [FIX F] Always include raw evidence — it's the ground truth the model must read
-    ctx_parts.append(f"EVIDENCE FROM DOCUMENTS:\n{raw_evidence[:3000]}")
+        # Larger evidence window for comparison queries
+        ctx_parts.append(f"EVIDENCE FROM DOCUMENTS:\n{raw_evidence[:5000]}")
+    else:
+        ctx_parts.append(f"EVIDENCE FROM DOCUMENTS:\n{raw_evidence[:3500]}")
 
     context = "\n\n".join(ctx_parts)
 
@@ -308,25 +366,21 @@ def generate_answer(
 Answer the question using ONLY the information in the evidence above.
 Follow the output format in your instructions exactly."""
 
-    return call_llm(prompt, system_prompt=SYNTHESIS_SYSTEM, max_tokens=900)
+    return call_llm(prompt, system_prompt=SYNTHESIS_SYSTEM, max_tokens=1200)
 
 
 # ── Answer Verification ────────────────────────────────────────────────────────
 
 def verify_answer(question: str, answer: str, facts: list, raw_evidence: str) -> dict:
-    """
-    [FIX C] Only flag answers that invent values not present anywhere in the evidence.
-    No longer fails just because phrasing differs from the fact table format.
-    """
-    # Build a compact evidence summary the verifier can check against
-    evidence_ctx = raw_evidence[:1200]
+    """Only flag answers that invent values not present anywhere in the evidence."""
+    evidence_ctx = raw_evidence[:1500]
     if facts:
-        evidence_ctx = json.dumps(facts[:20], indent=2) + "\n\n" + raw_evidence[:600]
+        evidence_ctx = json.dumps(facts[:20], indent=2) + "\n\n" + raw_evidence[:800]
 
     prompt = f"""Question: {question}
 
 Answer to verify:
-{answer[:700]}
+{answer[:800]}
 
 Evidence (ground truth):
 {evidence_ctx}
@@ -348,7 +402,12 @@ Reply ONLY with JSON: {{"valid": true, "issue": null}} or {{"valid": false, "iss
 # ── Output Parser ──────────────────────────────────────────────────────────────
 
 def parse_structured_answer(raw: str) -> dict:
-    """Parse labeled LLM output into UI-ready fields."""
+    """
+    Parse labeled LLM output into UI-ready fields.
+    Uses label-boundary lookahead without requiring exact newline position — works
+    regardless of how the LLM spaces or wraps its output.
+    Converts newlines in answer_text to <br> so they render correctly in the HTML div.
+    """
     if not raw:
         return {
             "answer_text":     "No answer generated.",
@@ -362,6 +421,8 @@ def parse_structured_answer(raw: str) -> dict:
     reasoning_text  = ""
     confidence      = "medium"
 
+    # Robust regex: lookahead does NOT require a leading \n so it works even
+    # when the LLM puts labels on the same line or uses inconsistent spacing.
     m = re.search(
         r"ANSWER:\s*(.+?)(?=EVIDENCE:|REASONING:|CONFIDENCE:|$)",
         raw, re.IGNORECASE | re.DOTALL,
@@ -401,51 +462,99 @@ def parse_structured_answer(raw: str) -> dict:
     }
 
 
+# ── Cross-Document Coverage Check ─────────────────────────────────────────────
+
+def _ensure_cross_document_coverage(
+    question: str,
+    all_chunks: list,
+    seen_keys: set,
+    all_scores: list,
+    raw_evidence_parts: list,
+    documents: list,
+    index,
+    k: int,
+) -> tuple:
+    """
+    [C] If any document in the KB has zero retrieved chunks, run a catch-up
+    retrieval pass for that document using the original question.
+    Returns updated (all_chunks, seen_keys, all_scores, raw_evidence_parts).
+    """
+    all_doc_names      = {d["filename"] for d in documents}
+    retrieved_doc_names = {c["filename"] for c in all_chunks}
+    missing_docs       = all_doc_names - retrieved_doc_names
+
+    if not missing_docs:
+        return all_chunks, seen_keys, all_scores, raw_evidence_parts
+
+    # Fetch extra candidates and filter to missing documents
+    catch_up = retrieve_top_k(question, index, documents, k=min(20, len(documents)))
+    for c in catch_up:
+        if c["filename"] not in missing_docs:
+            continue
+        key = c["text"][:200]
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        all_chunks.append(c)
+        all_scores.append(c["score"])
+        raw_evidence_parts.append(
+            f"[Source: {c['filename']} | Page {c['page']} | "
+            f"Relevance: {c['score']}]\n{c['text']}\n\n"
+        )
+
+    return all_chunks, seen_keys, all_scores, raw_evidence_parts
+
+
 # ── MAIN PIPELINE ──────────────────────────────────────────────────────────────
 
 def reasoning_pipeline(question: str, index, documents: list) -> dict:
     """
-    Full R-RAG pipeline — backward-compatible with app.py.
+    Full R-RAG pipeline.
 
-    [FIX A] Simple factual queries: 2 LLM calls max (decompose if long + generate).
-    [FIX E] Comparison queries: up to 4 LLM calls (decompose + extract + compare + generate).
-    [FIX B] LOW_CONF threshold lowered to 0.20.
+    Factual queries  : decompose → retrieve (k=6) → cross-doc check → generate → verify
+    Comparison queries: targeted sub-queries → retrieve (k=5 per query) →
+                        cross-doc check → extract facts → compare → generate → verify
     """
     trace = []
 
     # ── Classify query ────────────────────────────────────────────────────────
     comparison_mode = is_comparison_query(question)
-    retrieval_k     = 8 if comparison_mode else 5
 
     trace.append({
         "step": "Query Classification",
         "detail": (
-            "📊 Comparison / conflict query — wide retrieval (k=8) + fact extraction enabled."
+            "📊 Comparison / inconsistency query — targeted sub-query expansion + fact extraction."
             if comparison_mode else
-            "🔍 Factual query — standard retrieval (k=5), direct evidence synthesis."
+            "🔍 Factual query — standard retrieval, direct evidence synthesis."
         ),
     })
 
-    # ── Decompose ─────────────────────────────────────────────────────────────
-    trace.append({
-        "step": "Question Analysis",
-        "detail": (
-            "Comparison query: skipping decomposition."
-            if comparison_mode else
-            "Checking if question needs multi-step retrieval."
-        ),
-    })
-    sub_queries = decompose_question(question)
+    # ── Build sub-queries ─────────────────────────────────────────────────────
+    if comparison_mode:
+        trace.append({
+            "step": "Sub-Query Expansion",
+            "detail": "Generating targeted retrieval queries to cover all relevant document sections...",
+        })
+        sub_queries = generate_comparison_subqueries(question, documents)
+        retrieval_k = 5   # k per sub-query; 7-9 queries × 5 = up to 45 unique candidates
+    else:
+        trace.append({
+            "step": "Question Analysis",
+            "detail": "Checking if question needs multi-step retrieval.",
+        })
+        sub_queries = decompose_question(question)
+        retrieval_k = 6
+
     trace.append({
         "step": "Retrieval Plan",
         "detail": "\n".join(f"• {sq}" for sq in sub_queries),
     })
 
     # ── Retrieve ──────────────────────────────────────────────────────────────
-    all_chunks   = []
-    seen_keys    = set()
-    all_scores   = []
-    raw_evidence = ""
+    all_chunks          = []
+    seen_keys           = set()
+    all_scores          = []
+    raw_evidence_parts  = []
 
     for sq in sub_queries:
         trace.append({
@@ -468,12 +577,19 @@ def reasoning_pipeline(question: str, index, documents: list) -> dict:
             seen_keys.add(key)
             all_chunks.append(c)
             all_scores.append(c["score"])
-            raw_evidence += (
+            raw_evidence_parts.append(
                 f"[Source: {c['filename']} | Page {c['page']} | "
                 f"Relevance: {c['score']}]\n{c['text']}\n\n"
             )
 
-    doc_count = len({c["filename"] for c in all_chunks})
+    # ── [C] Cross-document coverage check ─────────────────────────────────────
+    all_chunks, seen_keys, all_scores, raw_evidence_parts = _ensure_cross_document_coverage(
+        question, all_chunks, seen_keys, all_scores, raw_evidence_parts, documents, index, k=15
+    )
+
+    raw_evidence = "".join(raw_evidence_parts)
+    doc_count    = len({c["filename"] for c in all_chunks})
+
     trace.append({
         "step": "Retrieval Complete",
         "detail": (
@@ -482,7 +598,6 @@ def reasoning_pipeline(question: str, index, documents: list) -> dict:
         ),
     })
 
-    # [FIX B] Lowered threshold: 0.20 is realistic for all-MiniLM-L6-v2
     low_confidence = False
     LOW_CONF       = 0.20
     if all_scores:
@@ -514,14 +629,14 @@ def reasoning_pipeline(question: str, index, documents: list) -> dict:
             "comparison":      {"conflicts": [], "matches": [], "missing": [], "summary": ""},
         }
 
-    # ── [FIX E] Fact extraction only for comparison queries ───────────────────
+    # ── Fact extraction + comparison (comparison queries only) ─────────────────
     facts      = []
     comparison = {"conflicts": [], "matches": [], "missing": [], "summary": ""}
 
     if comparison_mode:
         trace.append({
             "step": "Fact Extraction",
-            "detail": "Extracting (subject, attribute, value, source) triples for conflict detection...",
+            "detail": f"Extracting (subject, attribute, value, source) triples from {len(all_chunks)} chunks...",
         })
         facts = extract_facts(all_chunks)
         sources_with_facts = sorted({f["source"] for f in facts})
@@ -575,7 +690,7 @@ def reasoning_pipeline(question: str, index, documents: list) -> dict:
             "EVIDENCE:\nREASONING:\nCONFIDENCE: low"
         )
 
-    # ── [FIX C] Verify — only flag truly invented values ─────────────────────
+    # ── Verify ────────────────────────────────────────────────────────────────
     trace.append({
         "step": "Answer Verification",
         "detail": "Checking all claims are traceable to retrieved evidence...",
@@ -584,8 +699,6 @@ def reasoning_pipeline(question: str, index, documents: list) -> dict:
 
     if not verification.get("valid", True):
         issue = verification.get("issue") or "Unspecified verification failure."
-        # [FIX C] Only downgrade if answer claims a value not in evidence at all
-        # (not just because the verifier found a formatting mismatch)
         if "not present" in issue.lower() or "absent" in issue.lower() or "invented" in issue.lower():
             trace.append({
                 "step": "⚠️ Verification Failed",
@@ -610,18 +723,6 @@ def reasoning_pipeline(question: str, index, documents: list) -> dict:
         parsed["low_confidence"] = True
         parsed["confidence"]     = "low"
 
-    # Inject conflict bullets into evidence points for UI visibility
-    for conflict in comparison.get("conflicts", [])[:4]:
-        obs = conflict.get("observations", [])
-        if len(obs) >= 2:
-            parsed["evidence_points"].append(
-                f"⚠️ Conflict — '{conflict.get('subject', '?')}' / "
-                f"'{conflict.get('attribute', '?')}': "
-                + " vs ".join(
-                    f"{o['value']!r} ({o['source']})" for o in obs[:2]
-                )
-            )
-
     # Deduplicate sources for UI
     unique_sources, seen = [], set()
     for c in all_chunks:
@@ -636,7 +737,7 @@ def reasoning_pipeline(question: str, index, documents: list) -> dict:
         "answer_parsed":   parsed,
         "sub_queries":     sub_queries,
         "reasoning_trace": trace,
-        "sources":         unique_sources[:8],
+        "sources":         unique_sources[:10],
         "facts":           facts,
         "comparison":      comparison,
     }

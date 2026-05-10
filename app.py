@@ -794,29 +794,29 @@ for msg in st.session_state.chat_history:
                 unsafe_allow_html=True
             )
 
-        if answer_text:
-            st.markdown(f"""
+        # Answer — label + text in one HTML block so text renders inside the box.
+        # reasoning.py already converts \n → <br>, so inject answer_text directly.
+        st.markdown(f"""
 <div class="answer-block">
   <span class="answer-label">Answer</span>
-  <div class="answer-text">{answer_text}</div>
+  <div class="answer-text">{answer_text if answer_text else "No answer generated."}</div>
 </div>""", unsafe_allow_html=True)
 
-        if reasoning_text:
-            with st.expander("💡 Reasoning"):
-                st.markdown(f"*{reasoning_text}*")
+        # Reasoning — always shown
+        with st.expander("💡 Reasoning"):
+            if reasoning_text:
+                st.markdown(reasoning_text)
+            else:
+                st.markdown('<span style="color:#3a4560;font-size:0.85rem;">No reasoning available.</span>', unsafe_allow_html=True)
 
-        if msg.get("sources"):
-            with st.expander(f"📄 Sources ({len(msg['sources'])})"):
-                for i, src in enumerate(msg["sources"], 1):
-                    score_pct = int(src.get("score", 0) * 100)
-                    st.markdown(
-                        f'<span style="color:#4b5563;font-size:0.77rem;font-family:monospace;">'
-                        f'{src["filename"]} · p.{src["page"]} · {score_pct}%</span>',
-                        unsafe_allow_html=True
-                    )
-                    st.caption(src["text"][:350] + ("..." if len(src["text"]) > 350 else ""))
-                    if i < len(msg["sources"]):
-                        st.markdown("<hr style='border:none;border-top:1px solid rgba(255,255,255,0.04);margin:10px 0'>", unsafe_allow_html=True)
+        # Evidence — always shown
+        label = f"📋 Evidence ({len(evidence_points)})" if evidence_points else "📋 Evidence"
+        with st.expander(label):
+            if evidence_points:
+                for ep in evidence_points:
+                    st.markdown(f"- {ep}")
+            else:
+                st.markdown('<span style="color:#3a4560;font-size:0.85rem;">No evidence points extracted.</span>', unsafe_allow_html=True)
 
         st.markdown("</div>", unsafe_allow_html=True)
 
